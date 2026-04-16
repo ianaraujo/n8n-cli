@@ -1,65 +1,79 @@
 # n8n-cli
 
-CLI tool for reading and writing n8n workflows via the REST API. Built for use with **Claude Code** as an AI-assisted n8n workflow copilot.
+CLI tool that gives Claude Code read/write access to n8n workflows via the REST API. All output is JSON.
 
-All output is JSON, optimized for AI agent consumption.
+## 1. Install the CLI
 
-## Install
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# Requires Python 3.12+ and uv
-uv sync
+cd /path/to/n8n-cli/cli
+uv tool install .
 ```
 
-## Setup
+This puts the `n8n` binary on your PATH. Verify with `n8n --help`.
 
-Create a `.env` file at the project root:
+## 2. Add the skill globally
+
+Copy the n8n-copilot skill to your global Claude skills directory so it's available in any project:
 
 ```bash
-N8N_BASE_URL=http://localhost:5678
-N8N_API_KEY=your-api-key
-N8N_DEFAULT_WORKFLOW=optional-default-workflow-id
+cp -r /path/to/n8n-cli/skills/n8n-copilot ~/.claude/skills/n8n-copilot
+```
+
+## 3. Export environment variables
+
+Add these to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export N8N_BASE_URL=http://localhost:5678
+export N8N_API_KEY=your-api-key
+export N8N_DEFAULT_WORKFLOW=optional-default-workflow-id  # optional
 ```
 
 Generate an API key in n8n: **Settings > n8n API > Create API Key**.
 
-## Usage
+> **Local testing:** You can also create a `.env` file in the `cli/` directory. Shell variables take precedence over `.env`.
 
-```bash
-# List all workflows
-uv run n8n list
+## 4. Example workflow with Claude
 
-# Workflow graph (nodes + edges)
-uv run n8n flow <WORKFLOW_ID>
+Open any project in Claude Code and use the n8n-copilot skill:
 
-# Full workflow JSON
-uv run n8n get <WORKFLOW_ID>
-
-# Single node's JSON
-uv run n8n get <WORKFLOW_ID> --node "Node Name"
-
-# Recent executions
-uv run n8n executions <WORKFLOW_ID>
-
-# Execution details
-uv run n8n execution-data <EXECUTION_ID>
-
-# Patch a node parameter
-uv run n8n set-node-param <WORKFLOW_ID> --node "Node" --param "url" --value "https://example.com"
-
-# Update full workflow from file
-uv run n8n update-workflow <WORKFLOW_ID> --file workflow.json
-
-# Retry a failed execution
-uv run n8n retry <EXECUTION_ID> --use-latest
+```
+/n8n list my workflows
+/n8n show me the last failed execution of "My Workflow"
+/n8n fix the HTTP node in workflow 42 to use POST instead of GET
 ```
 
-All workflow commands accept `--name "partial match"` as an alternative to a workflow ID.
+Claude will use the `n8n` CLI to inspect and edit workflows directly.
 
-## Claude Code Integration
+## CLI reference
 
-See [n8n-copilot skill](.claude/skills/n8n-copilot/SKILL.md) for the full skill definition.
+```bash
+n8n list                                          # list all workflows
+n8n flow <ID>                                     # workflow graph (nodes + edges)
+n8n get <ID>                                      # full workflow JSON
+n8n get <ID> --node "Node Name"                   # single node JSON
+n8n executions <ID>                               # recent executions
+n8n execution-data <EXECUTION_ID>                 # execution details
+n8n set-node-param <ID> --node "N" --param "url" --value "https://…"
+n8n update-workflow <ID> --file workflow.json     # update from file
+n8n retry <EXECUTION_ID> --use-latest             # retry failed execution
+```
 
-## License
+All workflow commands accept `--name "partial match"` instead of an ID.
 
-MIT
+## Updating the CLI
+
+When you pull changes to the CLI source, reinstall the tool to pick them up:
+
+```bash
+cd /path/to/n8n-cli/cli
+uv tool install . --force
+```
+
+To also update the global skill:
+
+```bash
+cp -r /path/to/n8n-cli/skills/n8n-copilot ~/.claude/skills/n8n-copilot
+```

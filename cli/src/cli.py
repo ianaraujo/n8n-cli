@@ -12,11 +12,12 @@ from dotenv import load_dotenv
 
 from .client import N8nClient, N8nConfig
 
-load_dotenv()
+load_dotenv(override=False)
 
 app = typer.Typer(
     help="n8n Workflow Fetcher — fetch, inspect, and update n8n workflows via the REST API.",
     add_completion=False,
+    no_args_is_help=True,
     rich_markup_mode=None,
 )
 
@@ -405,10 +406,10 @@ def _set_nested(obj: Any, path: str, value: Any) -> None:
 @app.command(name="set-node-param")
 def set_node_param(
     ctx: typer.Context,
+    node: Annotated[str, typer.Option("--node", "-N", help="Node name to modify")],
+    param: Annotated[str, typer.Option("--param", "-p", help="Dotted path (e.g. 'queryParameters.parameters')")],
     workflow_id: Annotated[str | None, typer.Argument(help="Workflow ID")] = None,
     name: Annotated[str | None, typer.Option("--name", "-n", help="Find by name")] = None,
-    node: Annotated[str, typer.Option("--node", "-N", help="Node name to modify")] = ...,
-    param: Annotated[str, typer.Option("--param", "-p", help="Dotted path (e.g. 'queryParameters.parameters')")] = ...,
     value: Annotated[str | None, typer.Option("--value", "-v", help="New value (string)")] = None,
     json_value: Annotated[str | None, typer.Option("--json", "-j", help="New value as JSON (objects, arrays, numbers, booleans)")] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview without applying")] = False,
