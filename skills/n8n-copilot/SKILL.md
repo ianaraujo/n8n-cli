@@ -7,7 +7,7 @@ hooks:
     - matcher: "Bash"
       hooks:
         - type: command
-          command: "$CLAUDE_SKILL_DIR/scripts/preflight.sh"
+          command: "$HOME/.claude/skills/n8n-copilot/scripts/preflight.sh"
 ---
 
 # n8n Copilot
