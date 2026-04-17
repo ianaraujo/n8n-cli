@@ -21,18 +21,24 @@ Copy the n8n-copilot skill to your global Claude skills directory so it's availa
 cp -r /path/to/n8n-cli/skills/n8n-copilot ~/.claude/skills/n8n-copilot
 ```
 
-## 3. Export environment variables
-
-Add these to your `~/.bashrc` or `~/.zshrc`:
-
-```bash
-export N8N_BASE_URL=http://localhost:5678
-export N8N_API_KEY=your-api-key
-```
+## 3. Set environment variables
 
 Generate an API key in n8n: **Settings > n8n API > Create API Key**.
 
-> **Local testing:** You can also create a `.env` file in the `cli/` directory. Shell variables take precedence over `.env`.
+**Recommended — Claude Code project settings** (vars are injected into every Claude shell automatically):
+
+Add an `"env"` block to your project's `.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "N8N_BASE_URL": "http://localhost:5678",
+    "N8N_API_KEY": "your-api-key"
+  }
+}
+```
+
+**Alternative — `.env` file** at the project root for local dev/testing. Shell variables take precedence over `.env`.
 
 ## 4. Example workflow with Claude
 
