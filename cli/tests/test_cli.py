@@ -4,12 +4,19 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
+from src import cli as cli_mod
 from src.cli import (
+    _check_active_confirmed,
+    _check_blast_radius,
+    _check_read_only,
     _compute_diff,
     _find_node,
+    _resolve_workflow_id,
     _simplify_type,
+    _snapshot_workflow,
     _strip_node_noise,
     app,
 )
@@ -170,3 +177,162 @@ class TestSetNodeParamValidation:
              "--value", "x", "--json", '"y"'],
         )
         assert result.exit_code != 0
+
+
+# ── Guardrail tests ─────────────────────────────────────────────────────────
+
+
+class TestReadOnly:
+    def test_blocks_when_flag_set(self, monkeypatch):
+        monkeypatch.setenv("N8N_CLI_READ_ONLY", "1")
+        with pytest.raises(typer.Exit):
+            _check_read_only()
+
+    def test_passes_when_unset(self, monkeypatch):
+        monkeypatch.delenv("N8N_CLI_READ_ONLY", raising=False)
+        _check_read_only()
+
+    def test_accepts_truthy_variants(self, monkeypatch):
+        for val in ("true", "yes", "on", "TRUE"):
+            monkeypatch.setenv("N8N_CLI_READ_ONLY", val)
+            with pytest.raises(typer.Exit):
+                _check_read_only()
+
+    def test_ignores_falsey_variants(self, monkeypatch):
+        for val in ("0", "false", "no", ""):
+            monkeypatch.setenv("N8N_CLI_READ_ONLY", val)
+            _check_read_only()
+
+    def test_set_node_param_blocked(self, monkeypatch):
+        monkeypatch.setenv("N8N_CLI_READ_ONLY", "1")
+        result = runner.invoke(
+            app,
+            ["--base-url", "http://localhost:5678", "--api-key", "key",
+             "set-node-param", "wf-id", "--node", "N", "--param", "url", "--value", "x"],
+        )
+        assert result.exit_code != 0
+
+    def test_retry_blocked(self, monkeypatch):
+        monkeypatch.setenv("N8N_CLI_READ_ONLY", "1")
+        result = runner.invoke(
+            app,
+            ["--base-url", "http://localhost:5678", "--api-key", "key",
+             "retry", "exec-id"],
+        )
+        assert result.exit_code != 0
+
+
+class TestActiveConfirmation:
+    def test_inactive_workflow_passes(self):
+        _check_active_confirmed({"active": False, "name": "W"}, confirm_active=False)
+
+    def test_active_blocked_without_confirm(self):
+        with pytest.raises(typer.Exit):
+            _check_active_confirmed({"active": True, "name": "W"}, confirm_active=False)
+
+    def test_active_allowed_with_flag(self):
+        _check_active_confirmed({"active": True, "name": "W"}, confirm_active=True)
+
+    def test_active_allowed_with_env(self, monkeypatch):
+        monkeypatch.setenv("N8N_CLI_CONFIRM_ACTIVE", "1")
+        _check_active_confirmed({"active": True, "name": "W"}, confirm_active=False)
+
+
+class TestBlastRadius:
+    def _wf(self, n_nodes, n_edges=0):
+        nodes = [{"name": f"N{i}"} for i in range(n_nodes)]
+        connections = {}
+        remaining = n_edges
+        for i in range(n_nodes):
+            if remaining <= 0:
+                break
+            targets = [{"node": f"T{j}"} for j in range(min(remaining, 3))]
+            remaining -= len(targets)
+            connections[f"N{i}"] = {"main": [targets]}
+        return {"nodes": nodes, "connections": connections}
+
+    def test_no_removal_passes(self):
+        wf = self._wf(5, 4)
+        stats = _check_blast_radius(wf, wf, force=False)
+        assert stats["removed_nodes"] == 0
+        assert stats["removed_edges"] == 0
+
+    def test_small_removal_passes(self):
+        current = self._wf(10, 10)
+        incoming = self._wf(8, 9)
+        _check_blast_radius(current, incoming, force=False)
+
+    def test_node_count_cap_blocks(self):
+        current = self._wf(20, 0)
+        incoming = self._wf(10, 0)  # removes 10 nodes (> 3 cap, > 50%)
+        with pytest.raises(typer.Exit):
+            _check_blast_radius(current, incoming, force=False)
+
+    def test_node_percent_cap_blocks(self):
+        current = self._wf(4, 0)
+        incoming = self._wf(1, 0)  # removes 3 (== 75%, exceeds 50%)
+        with pytest.raises(typer.Exit):
+            _check_blast_radius(current, incoming, force=False)
+
+    def test_edge_cap_blocks(self):
+        current = self._wf(5, 20)
+        incoming = self._wf(5, 4)  # removes 16 edges (> 5 cap)
+        with pytest.raises(typer.Exit):
+            _check_blast_radius(current, incoming, force=False)
+
+    def test_force_bypasses(self):
+        current = self._wf(20, 0)
+        incoming = self._wf(0, 0)
+        stats = _check_blast_radius(current, incoming, force=True)
+        assert stats["removed_nodes"] == 20
+
+
+class TestSnapshot:
+    def test_writes_json_to_backup_root(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_mod, "BACKUP_ROOT", tmp_path)
+        wf = {"name": "Demo", "nodes": [{"name": "A"}], "connections": {}}
+        path = _snapshot_workflow("wf-123", wf)
+        assert path.exists()
+        assert path.parent == tmp_path / "wf-123"
+        assert json.loads(path.read_text()) == wf
+
+    def test_sanitizes_unsafe_ids(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_mod, "BACKUP_ROOT", tmp_path)
+        path = _snapshot_workflow("../evil/id", {})
+        assert tmp_path in path.parents
+        assert ".." not in path.parts
+        assert "/" not in path.parent.name
+
+
+class TestExactMatch:
+    def _client(self, names):
+        client = MagicMock()
+        client.list_workflows.return_value = {
+            "data": [{"id": f"id-{i}", "name": n} for i, n in enumerate(names)]
+        }
+        return client
+
+    def test_fuzzy_substring_works_when_not_exact(self):
+        client = self._client(["Sync Prod", "Sync Test"])
+        # "Sync Test" exact match among the two — picks it
+        result = _resolve_workflow_id(client, None, "sync test", exact=False)
+        assert result == "id-1"
+
+    def test_exact_rejects_case_mismatch(self):
+        client = self._client(["Sync Prod"])
+        with pytest.raises(typer.Exit):
+            _resolve_workflow_id(client, None, "sync prod", exact=True)
+
+    def test_exact_rejects_substring(self):
+        client = self._client(["Sync Prod"])
+        with pytest.raises(typer.Exit):
+            _resolve_workflow_id(client, None, "Sync", exact=True)
+
+    def test_exact_accepts_exact_name(self):
+        client = self._client(["Sync Prod", "Sync Test"])
+        assert _resolve_workflow_id(client, None, "Sync Prod", exact=True) == "id-0"
+
+    def test_id_bypasses_resolution(self):
+        client = MagicMock()
+        assert _resolve_workflow_id(client, "explicit-id", None, exact=True) == "explicit-id"
+        client.list_workflows.assert_not_called()

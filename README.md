@@ -28,7 +28,6 @@ Add these to your `~/.bashrc` or `~/.zshrc`:
 ```bash
 export N8N_BASE_URL=http://localhost:5678
 export N8N_API_KEY=your-api-key
-export N8N_DEFAULT_WORKFLOW=optional-default-workflow-id  # optional
 ```
 
 Generate an API key in n8n: **Settings > n8n API > Create API Key**.
@@ -62,6 +61,17 @@ n8n retry <EXECUTION_ID> --use-latest             # retry failed execution
 ```
 
 All workflow commands accept `--name "partial match"` instead of an ID.
+
+## Read-only mode
+
+Set `N8N_CLI_READ_ONLY=1` to disable all write commands (`set-node-param`, `update-workflow`, `retry`). Useful when you want Claude to inspect and debug workflows without any risk of modifying them.
+
+```bash
+export N8N_CLI_READ_ONLY=1   # block all writes
+unset N8N_CLI_READ_ONLY      # re-enable writes
+```
+
+Any write attempt while the flag is set exits with an error and a message explaining how to unset it.
 
 ## Updating the CLI
 

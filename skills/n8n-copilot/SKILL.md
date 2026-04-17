@@ -7,7 +7,7 @@ hooks:
     - matcher: "Bash"
       hooks:
         - type: command
-          command: "./scripts/preflight.sh"
+          command: "$CLAUDE_SKILL_DIR/scripts/preflight.sh"
 ---
 
 # n8n Copilot
@@ -28,9 +28,16 @@ All commands emit JSON on stdout. Workflow-targeted commands accept either a pos
 | `n8n get <wf>` | Full workflow JSON | `--node "Name"` (one node only), `--compact` (strip position/id), `--keep-creds` (required for round-trip edits), `-o FILE` |
 | `n8n executions <wf>` | Recent executions (id, status, timestamps) | `--status {success,error,waiting,running}`, `--limit` |
 | `n8n execution-data <exec_id>` | Per-node run summary (items out, ms, error) | `--node "Name"` for full input/output of one node |
-| `n8n set-node-param <wf>` | Patch one param in-place (no file round-trip) | `--node`, `--param "dot.path"`, `--value` OR `--json`, `--dry-run` |
-| `n8n update-workflow <wf>` | PUT full workflow JSON (from `--file` or stdin) | `--file`, `--dry-run` (shows diff) |
+| `n8n set-node-param <wf>` | Patch one param in-place (no file round-trip) | `--node`, `--param "dot.path"`, `--value` OR `--json`, `--dry-run`, `--confirm-active` |
+| `n8n update-workflow <wf>` | PUT full workflow JSON (from `--file` or stdin) | `--file`, `--dry-run` (shows diff), `--confirm-active`, `--force` |
 | `n8n retry <exec_id>` | Retry a failed execution | `--use-latest` (retry with current workflow version) |
+
+**Write-command rules** (applied by the CLI, not the agent):
+- Workflow must be selected by ID or **exact** `--name`. Fuzzy substring matching is read-only.
+- If the workflow is `active`, the write requires `--confirm-active` (or `N8N_CLI_CONFIRM_ACTIVE=1`). The CLI will still deactivate before writing — the flag just forces explicit acknowledgement.
+- `update-workflow` is capped on removals: removing >3 nodes / >50% of nodes, or >5 edges / >50% of edges, is rejected without `--force`. Use `--dry-run` first — its `removals` field shows the counts.
+- Every successful write writes a snapshot of the pre-change workflow to `~/.n8n-cli/backups/<wf_id>/<timestamp>.json`. The response includes `backup.restore_cmd` — surface it to the user.
+- Set `N8N_CLI_READ_ONLY=1` to disable `set-node-param`, `update-workflow`, and `retry` entirely (useful for exploration sessions).
 
 Add `--help` to any command for full flags.
 
@@ -56,9 +63,10 @@ Always preview mutations with `--dry-run` first unless the user has already appr
 
 **Single-parameter patch** (preferred when only one value changes):
 ```bash
-n8n set-node-param --name "X" --node "HTTP Request" --param "url" --value "https://..." --dry-run
-n8n set-node-param --name "X" --node "HTTP Request" --param "url" --value "https://..."
+n8n set-node-param --name "Exact Workflow Name" --node "HTTP Request" --param "url" --value "https://..." --dry-run
+n8n set-node-param --name "Exact Workflow Name" --node "HTTP Request" --param "url" --value "https://..." --confirm-active
 ```
+`--name` must be the **exact** workflow name (or use the ID positional argument). If the workflow is active, add `--confirm-active`.
 `--param` is a dotted path under the node's `parameters` object. For non-string values, use `--json` instead of `--value`:
 ```bash
 n8n set-node-param --name "X" --node "Loop" --param "options.batchSize" --json 50
@@ -67,12 +75,16 @@ n8n set-node-param --name "X" --node "HTTP" --param "queryParameters.parameters"
 
 **Full-workflow edit** (multiple changes, structural changes, or adding/removing nodes):
 ```bash
-n8n get --name "X" --keep-creds -o /tmp/wf.json   # --keep-creds is required for round-trip
+n8n get --name "X" --keep-creds -o /tmp/wf.json   # --keep-creds required for round-trip; fuzzy --name is fine for reads
 # edit /tmp/wf.json
-n8n update-workflow --name "X" --file /tmp/wf.json --dry-run   # shows structural diff
-n8n update-workflow --name "X" --file /tmp/wf.json
+n8n update-workflow --name "Exact Workflow Name" --file /tmp/wf.json --dry-run   # exact name required for writes
+n8n update-workflow --name "Exact Workflow Name" --file /tmp/wf.json --confirm-active
 ```
-`update-workflow` also backfills credential references from the live workflow, so a file exported without `--keep-creds` won't lose credentials — but keeping them makes the diff cleaner.
+`update-workflow` backfills credential references from the live workflow, so a file exported without `--keep-creds` won't lose credentials — but keeping them makes the diff cleaner.
+
+If the dry-run `removals` field shows you're removing more than a few nodes or edges, that's intentional only if the user asked for a deletion. Pass `--force` to override the cap — otherwise the CLI will reject the write.
+
+The response for a successful write includes `backup.path` and `backup.restore_cmd`. Report the restore command to the user; it's the fastest way to revert if the change breaks something.
 
 **Retry after a fix**
 - `n8n retry <id> --use-latest` — retry with the updated workflow (use after any change).

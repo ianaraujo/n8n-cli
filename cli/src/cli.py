@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -21,9 +24,118 @@ app = typer.Typer(
     rich_markup_mode=None,
 )
 
+# Removing >N nodes/edges OR >PCT fraction of either triggers the blast-radius
+# block on update-workflow. --force overrides.
+BLAST_NODE_THRESHOLD = 3
+BLAST_EDGE_THRESHOLD = 5
+BLAST_PCT_THRESHOLD = 0.5
+
+BACKUP_ROOT = Path.home() / ".n8n-cli" / "backups"
+_SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
+
 
 def _err(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _env_flag(name: str) -> bool:
+    val = os.environ.get(name, "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _check_read_only() -> None:
+    """Block write commands when N8N_CLI_READ_ONLY is set."""
+    if _env_flag("N8N_CLI_READ_ONLY"):
+        _err(
+            "Error: write blocked — N8N_CLI_READ_ONLY is set. "
+            "Unset it in the current shell to enable writes."
+        )
+        raise typer.Exit(1)
+
+
+def _check_active_confirmed(wf: dict[str, Any], confirm_active: bool) -> None:
+    """Require explicit confirmation before writing to an active workflow."""
+    if not wf.get("active", False):
+        return
+    if confirm_active or _env_flag("N8N_CLI_CONFIRM_ACTIVE"):
+        return
+    name = wf.get("name", "<unknown>")
+    _err(
+        f"Error: workflow '{name}' is active. Re-run with --confirm-active "
+        "(or set N8N_CLI_CONFIRM_ACTIVE=1) to acknowledge that it will be "
+        "deactivated before the write."
+    )
+    raise typer.Exit(1)
+
+
+def _snapshot_workflow(wf_id: str, wf: dict[str, Any]) -> Path:
+    """Persist a pre-write snapshot of the live workflow. Returns the path."""
+    safe_id = _SAFE_ID_RE.sub("_", wf_id) or "unknown"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target_dir = BACKUP_ROOT / safe_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / f"{stamp}.json"
+    path.write_text(json.dumps(wf, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _count_edges(connections: dict[str, Any]) -> int:
+    total = 0
+    for outputs in connections.values():
+        for branch in outputs.get("main", []):
+            total += len(branch)
+    return total
+
+
+def _check_blast_radius(
+    current: dict[str, Any], incoming: dict[str, Any], force: bool,
+) -> dict[str, int]:
+    """Return removal counts. Block the write if caps are exceeded without --force."""
+    cur_names = {n["name"] for n in current.get("nodes", [])}
+    inc_names = {n["name"] for n in incoming.get("nodes", [])}
+    removed_nodes = len(cur_names - inc_names)
+
+    cur_edges = _count_edges(current.get("connections", {}))
+    inc_edges = _count_edges(incoming.get("connections", {}))
+    removed_edges = max(0, cur_edges - inc_edges)
+
+    stats = {
+        "removed_nodes": removed_nodes,
+        "total_nodes": len(cur_names),
+        "removed_edges": removed_edges,
+        "total_edges": cur_edges,
+    }
+
+    if force:
+        return stats
+
+    node_pct = removed_nodes / len(cur_names) if cur_names else 0
+    edge_pct = removed_edges / cur_edges if cur_edges else 0
+
+    node_blast = removed_nodes > BLAST_NODE_THRESHOLD or node_pct > BLAST_PCT_THRESHOLD
+    edge_blast = removed_edges > BLAST_EDGE_THRESHOLD or edge_pct > BLAST_PCT_THRESHOLD
+
+    if node_blast or edge_blast:
+        _err(
+            "Error: blast radius exceeded — "
+            f"removing {removed_nodes}/{len(cur_names)} nodes "
+            f"and {removed_edges}/{cur_edges} edges. "
+            f"Caps: {BLAST_NODE_THRESHOLD} nodes or "
+            f"{int(BLAST_PCT_THRESHOLD * 100)}%, "
+            f"{BLAST_EDGE_THRESHOLD} edges or "
+            f"{int(BLAST_PCT_THRESHOLD * 100)}%. "
+            "Re-run with --force if the removal is intentional."
+        )
+        raise typer.Exit(1)
+
+    return stats
+
+
+def _backup_payload(wf_id: str, path: Path) -> dict[str, str]:
+    return {
+        "path": str(path),
+        "restore_cmd": f"n8n update-workflow {wf_id} --file {path} --force",
+    }
 
 
 def _out(data: Any, compact: bool = False) -> None:
@@ -45,7 +157,13 @@ def _get_config(ctx: typer.Context) -> N8nConfig:
     return N8nConfig(base_url=url, api_key=key)
 
 
-def _resolve_workflow_id(client: N8nClient, workflow_id: str | None, name: str | None) -> str:
+def _resolve_workflow_id(
+    client: N8nClient,
+    workflow_id: str | None,
+    name: str | None,
+    *,
+    exact: bool = False,
+) -> str:
     if workflow_id:
         return workflow_id
     if not name:
@@ -55,11 +173,23 @@ def _resolve_workflow_id(client: N8nClient, workflow_id: str | None, name: str |
     result = client.list_workflows(limit=100)
     workflows = result.get("data", [])
 
-    exact = [w for w in workflows if w.get("name", "").lower() == name.lower()]
-    matches = exact or [w for w in workflows if name.lower() in w.get("name", "").lower()]
+    if exact:
+        matches = [w for w in workflows if w.get("name", "") == name]
+    else:
+        exact_matches = [w for w in workflows if w.get("name", "").lower() == name.lower()]
+        matches = exact_matches or [
+            w for w in workflows if name.lower() in w.get("name", "").lower()
+        ]
 
     if not matches:
-        _err(f"Error: No workflow found matching '{name}'")
+        if exact:
+            _err(
+                f"Error: No workflow with exact name '{name}'. "
+                "Write commands require an exact name or ID (fuzzy match is "
+                "read-only). Use `n8n list` to find the exact name."
+            )
+        else:
+            _err(f"Error: No workflow found matching '{name}'")
         raise typer.Exit(1)
     if len(matches) > 1:
         _err(f"Error: Multiple workflows match '{name}':")
@@ -71,11 +201,15 @@ def _resolve_workflow_id(client: N8nClient, workflow_id: str | None, name: str |
 
 
 def _fetch_workflow(
-    client: N8nClient, workflow_id: str | None, name: str | None,
+    client: N8nClient,
+    workflow_id: str | None,
+    name: str | None,
+    *,
+    exact: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Resolve workflow ID and fetch workflow data. Raises typer.Exit(1) on error."""
     try:
-        wf_id = _resolve_workflow_id(client, workflow_id, name)
+        wf_id = _resolve_workflow_id(client, workflow_id, name, exact=exact)
         wf = client.get_workflow(wf_id)
     except typer.Exit:
         raise
@@ -408,13 +542,16 @@ def set_node_param(
     ctx: typer.Context,
     node: Annotated[str, typer.Option("--node", "-N", help="Node name to modify")],
     param: Annotated[str, typer.Option("--param", "-p", help="Dotted path (e.g. 'queryParameters.parameters')")],
-    workflow_id: Annotated[str | None, typer.Argument(help="Workflow ID")] = None,
-    name: Annotated[str | None, typer.Option("--name", "-n", help="Find by name")] = None,
+    workflow_id: Annotated[str | None, typer.Argument(help="Workflow ID (fuzzy --name is rejected; use exact name or ID)")] = None,
+    name: Annotated[str | None, typer.Option("--name", "-n", help="Exact workflow name (no substring matching)")] = None,
     value: Annotated[str | None, typer.Option("--value", "-v", help="New value (string)")] = None,
     json_value: Annotated[str | None, typer.Option("--json", "-j", help="New value as JSON (objects, arrays, numbers, booleans)")] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview without applying")] = False,
+    confirm_active: Annotated[bool, typer.Option("--confirm-active", help="Acknowledge that an active workflow will be deactivated")] = False,
 ) -> None:
     """Patch a single node parameter in-place."""
+    _check_read_only()
+
     if value is None and json_value is None:
         _err("Error: Provide either --value or --json.")
         raise typer.Exit(1)
@@ -431,10 +568,11 @@ def set_node_param(
             raise typer.Exit(1)
 
     config = _get_config(ctx)
+    backup_path: Path | None = None
 
     with N8nClient(config) as client:
         try:
-            wf_id, wf = _fetch_workflow(client, workflow_id, name)
+            wf_id, wf = _fetch_workflow(client, workflow_id, name, exact=True)
             target = _find_node(wf, node)
 
             param_root = target["parameters"]
@@ -454,8 +592,13 @@ def set_node_param(
                     "param": f"parameters.{param}",
                     "current": current_value,
                     "new": parsed_value,
+                    "active": wf.get("active", False),
                 })
                 return
+
+            _check_active_confirmed(wf, confirm_active)
+
+            backup_path = _snapshot_workflow(wf_id, wf)
 
             _set_nested(param_root, param, parsed_value)
 
@@ -481,6 +624,8 @@ def set_node_param(
     }
     if was_active:
         result["deactivated"] = True
+    if backup_path is not None:
+        result["backup"] = _backup_payload(wf_id, backup_path)
     _out(result)
 
 
@@ -513,34 +658,46 @@ def _merge_credentials(
 @app.command(name="update-workflow")
 def update_workflow(
     ctx: typer.Context,
-    workflow_id: Annotated[str | None, typer.Argument(help="Workflow ID")] = None,
-    name: Annotated[str | None, typer.Option("--name", "-n", help="Find by name")] = None,
+    workflow_id: Annotated[str | None, typer.Argument(help="Workflow ID (fuzzy --name is rejected; use exact name or ID)")] = None,
+    name: Annotated[str | None, typer.Option("--name", "-n", help="Exact workflow name (no substring matching)")] = None,
     file: Annotated[Path | None, typer.Option("--file", "-f", help="Path to workflow JSON file")] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Show diff without applying")] = False,
+    confirm_active: Annotated[bool, typer.Option("--confirm-active", help="Acknowledge that an active workflow will be deactivated")] = False,
+    force: Annotated[bool, typer.Option("--force", help="Bypass the blast-radius cap on node/edge removals")] = False,
 ) -> None:
     """Update a workflow from JSON (file or stdin). Deactivates active workflows before update.
 
     Credentials are automatically backfilled from the live workflow.
     """
+    _check_read_only()
+
     payload = _read_workflow_json(file)
     config = _get_config(ctx)
+    backup_path: Path | None = None
 
     with N8nClient(config) as client:
         try:
-            wf_id, current = _fetch_workflow(client, workflow_id, name)
+            wf_id, current = _fetch_workflow(client, workflow_id, name, exact=True)
             changes = _compute_diff(current, payload)
 
             _merge_credentials(current.get("nodes", []), payload.get("nodes", []))
 
             if dry_run:
+                blast = _check_blast_radius(current, payload, force=True)
                 _out({
                     "dry_run": True,
                     "workflow": current.get("name", wf_id),
                     "id": wf_id,
                     "active": current.get("active", False),
                     "changes": changes or ["no structural changes"],
+                    "removals": blast,
                 })
                 return
+
+            _check_active_confirmed(current, confirm_active)
+            _check_blast_radius(current, payload, force=force)
+
+            backup_path = _snapshot_workflow(wf_id, current)
 
             was_active = current.get("active", False)
             if was_active:
@@ -562,6 +719,8 @@ def update_workflow(
     }
     if was_active:
         result["deactivated"] = True
+    if backup_path is not None:
+        result["backup"] = _backup_payload(wf_id, backup_path)
     _out(result)
 
 
@@ -572,6 +731,7 @@ def retry(
     use_latest: Annotated[bool, typer.Option("--use-latest", help="Retry with the latest workflow version")] = False,
 ) -> None:
     """Retry a failed execution. Returns the new execution ID and status."""
+    _check_read_only()
     config = _get_config(ctx)
 
     with N8nClient(config) as client:
